@@ -2,6 +2,10 @@
 
 Bluetooth Deauthentication, Denial-of-Service & Hijack Tool
 
+
+https://github.com/user-attachments/assets/de1cbfda-ca7d-460b-8af3-c45613496dd1
+
+
 Three-stage attack on Fast Pair devices via CVE-2025-36911:
 
 1. **Stage 1 (Extraction)**: Extract permanent hidden BD ADDR from privacy-randomized addresses
