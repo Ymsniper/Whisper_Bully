@@ -2,6 +2,10 @@
 
 Bluetooth Deauthentication & Denial-of-Service Tool
 
+
+https://github.com/user-attachments/assets/7e78383e-8936-47f8-94c5-68844b264499
+
+
 Two-stage attack on Fast Pair devices via CVE-2025-36911:
 1. **Stage 1 (Extraction)**: Extract permanent hidden BD ADDR from privacy-randomized addresses
 2. **Stage 2 (Flood)**: Execute sustained L2CAP denial-of-service using EMP mode reconnect cycling
