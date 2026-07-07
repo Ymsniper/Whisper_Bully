@@ -1,0 +1,23 @@
+CC ?= cc
+INSTALL ?= install
+PREFIX ?= /usr/local
+
+project = l2flood
+
+LDFLAGS = -lbluetooth
+CFLAGS ?= -no-pie -fno-pie
+
+parallel:
+	$(CC) $(CFLAGS) $(project).c -fopenmp $(LDFLAGS) -o $(project)
+
+serial:
+	$(CC) $(CFLAGS) $(project).c $(LDFLAGS) -o $(project)
+
+clean:
+	rm -f ./$(project)
+
+install:
+	mkdir -p "$(DESTDIR)$(PREFIX)/bin"
+	$(INSTALL) ./$(project) "$(DESTDIR)$(PREFIX)/bin/$(project)"
+
+.PHONY: parallel serial clean install
