@@ -12,8 +12,9 @@ Extracts the real Bluetooth address from devices during pairing by monitoring `b
 
 ### Stage 1: Extraction (CVE-2025-36911)
 
-Fast Pair devices use randomized temporary addresses for privacy. During pairing, the device reveals its permanent address via a `[CHG] Device` message in `bluetoothctl` output. Whisper_Bully monitors that output and captures the address.
-
+Most Bluetooth devices are paired and set to non-discoverable, since general discovery scans are what most people/OSes turn off after initial setup,this is what the exploit does to reveal the hidden full BD_ADDR:
+The Whisper Pair exploit (CVE-2025-36911) works by first connecting to the target device via BLE and writing a forged Fast Pair pairing request (0x00 + random 64‑byte public key + nonce) to the key‑based pairing characteristic (UUID 1236). It then writes a fake 16‑byte Account Key to the account key characteristic (UUID 1238), tricking the device into completing the bonding process. Simultaneously, the tool triggers bluetoothctl pair and monitors its output for the [CHG] Device message, which reveals the permanent BD_ADDR when the device switches from its temporary random MAC. This exposes the factory‑programmed address, enabling reliable re‑connection and subsequent denial‑of‑service attacks.
+- **Steps:**
 1. Scans for devices advertising Fast Pair service (UUID `fe2c`)
 2. Establishes BLE connection to target
 3. Triggers pairing, monitors for `[CHG] Device` address change
