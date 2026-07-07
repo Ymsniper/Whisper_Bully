@@ -14,13 +14,18 @@ Extracts the real Bluetooth address from devices during pairing by monitoring `b
 
 ### Stage 1: Extraction (CVE-2025-36911)
 
-Fast Pair devices use randomized temporary addresses for privacy. During pairing, the device reveals its permanent address via a `[CHG] Device` message in `bluetoothctl` output. Whisper Bully monitors that output and captures the address.
+Most Bluetooth devices are paired and set to non-discoverable, since general discovery scans are what most people/OSes turn off after initial setup. This is what the exploit does to reveal the hidden full BD_ADDR:
 
+The Whisper Pair exploit (CVE-2025-36911) works by first connecting to the target device via BLE and writing a forged Fast Pair pairing request (0x00 + random 64‑byte public key + nonce) to the key‑based pairing characteristic (UUID 1236). It then writes a fake 16‑byte Account Key to the account key characteristic (UUID 1238), tricking the device into completing the bonding process. Simultaneously, the tool triggers bluetoothctl pair and monitors its output for the [CHG] Device message, which reveals the permanent BD_ADDR when the device switches from its temporary random MAC. This exposes the factory‑programmed address, enabling reliable re‑connection and subsequent denial‑of‑service attacks.
+
+**Steps:**
 1. Scans for devices advertising Fast Pair service (UUID `fe2c`)
 2. Establishes BLE connection to target
-3. Triggers pairing, monitors for `[CHG] Device` address change
-4. Captures permanent BD ADDR that appears during pairing
-5. Falls back to device list comparison if direct capture fails
+3. Writes forged Fast Pair pairing request to UUID 1236
+4. Writes fake Account Key to UUID 1238
+5. Triggers bluetoothctl pair and monitors for `[CHG] Device` address change
+6. Captures permanent BD ADDR that appears during bonding
+7. Falls back to device list comparison if direct capture fails
 
 ### Stage 2: Flooding (L2CAP EMP Mode)
 
@@ -404,14 +409,13 @@ sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -f
 ### Stage 1 (Extraction)
 - Only works on Linux with `bluetoothctl`
 - Some devices may not advertise Fast Pair service
-- Advertised MAC address could change during connection (timing issue)
-- Device must be forgotten if previously paired: `bluetoothctl remove <addr>`
+- Advertised MAC address could change during the connection step (address rolling - timing issue)
+- If you're testing on a device that has already been connected/paired via this tool or manually, you need to forget (remove) it first so the script can work properly.
 
 ### Stage 2 (Flooding)
 - Requires knowing permanent address (get from Stage 1 or other means)
 - Target must be within Bluetooth range and powered on
 - Device recovers after attack stops (no permanent damage)
-- May fail on devices with robust L2CAP error handling
 
 ### Stage 3 (Hijack)
 - Requires device to enter unresponsive state (Stage 2 dependency)
@@ -427,29 +431,22 @@ sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -f
 ### No devices found
 - Check `bluetoothctl` is working: `sudo bluetoothctl list`
 - Increase scan duration: `-s 30`
-- Ensure devices are in pairing mode
 
 ### BLE connection failed, Failed to extract
-- If device was previously paired via this tool or manually, forget it first: `sudo bluetoothctl remove <addr>`
-- Wait 10 seconds and try again
+- If you're testing on a device that has already been connected/paired via this tool or manually, you need to forget (remove) it first so the script can work properly.
+- Use: `sudo bluetoothctl remove <addr>`
 - Device may not support Fast Pair service
 
 ### Extraction fails with fallback
 - Timing issue: pairing completed before address capture
 - Device may not support Fast Pair service advertisement
-- Try again: timing is unpredictable with some hardware
+- Try again: timing is sometimes unpredictable
 
 ### Flood has no effect (devices still responsive)
 - Increase thread count: `-t 16`
 - Use multiple adapters simultaneously
 - Verify permanent address is correct
 - Some devices may have robust L2CAP error handling
-
-### Hijack fails (cannot connect)
-- Device may have recovered from flood (try longer duration)
-- Device may be powered off
-- Verify device was truly unresponsive during probe
-- Try again immediately after flood completes
 
 ### Permission denied
 - Run with `sudo`
