@@ -46,20 +46,20 @@ The CVE-2025-36911 firmware fix adds a pairing mode check to the Fast Pair GATT 
 
 ### Stage 2 — L2CAP Flooding (EMP Burst-Reconnect Mode)
 
-Once the permanent address is known, optionally execute a sustained L2CAP denial-of-service using `l2flood -R` (EMP mode):
+Once the permanent address is known, optionally execute a sustained L2CAP denial-of-service using a modified version of `l2flood`.
 
-**Flood cycle (per thread):**
-1. Establish L2CAP connection to target using permanent address
-2. Send 50 L2CAP echo packets in a burst
-3. Intentionally close the connection
-4. Sleep 5ms to resynchronize all threads (wave-like synchronized pressure)
-5. Loop indefinitely
+**Two modes are used across the tool:**
+
+**`-R` flag — EMP mode (Stage 2 flood)**
+Silent fire-and-forget burst-reconnect. All threads synchronize their connect → burst → forced close cycles so the target receives periodic full ACL teardowns rather than staggered L2CAP channel shuffling it can absorb. Uses `SO_LINGER {1,0}` for immediate RST teardown on every close. Produces no stdout output during normal operation — connect errors are suppressed to stderr and only printed periodically.
+
+**Normal mode (Stage 3 hijack probe)**
+Used without `-R` to probe whether the target is still responding. This mode was also improved — it now handles reconnects automatically and outputs `no response from <addr>: id N` when the target stops responding, which is what `wb.py` monitors to trigger the hijack.
 
 **Result:** Target device becomes unresponsive to normal connection attempts while the flood is active. Device recovers fully when the attack stops — no permanent damage.
 
 **Multithread behavior:**
-- Each thread independently cycles connect → burst → close
-- Threads resync every 5ms for coordinated wave pressure
+- Threads synchronize after each burst cycle so pressure hits the target simultaneously
 - Effective up to ~16 threads on typical hardware; diminishing returns beyond that
 - Multiple HCI adapters can be used simultaneously for increased pressure
 
@@ -303,15 +303,19 @@ The `bluetoothctl pair` call that runs concurrently may or may not succeed — t
 
 ### Stage 2 — EMP Mode (`l2flood -R`)
 
-The `-R` flag in `l2flood` implements burst-reconnect cycling:
+This modified `l2flood` has two modes depending on the intended stage:
 
-1. Establish L2CAP connection
-2. Send 50 echo packets
-3. Close connection intentionally
-4. 5ms thread resynchronization sleep
-5. Loop
+**`-R` flag — EMP mode (DoS only, no hijack)**
+Used when running Stage 2 standalone without proceeding to Stage 3.
+Silent fire-and-forget burst-reconnect — all threads synchronize their
+connect → burst → forced close cycles to guarantee periodic full ACL
+teardowns. Produces no stdout output during normal operation.
 
-This synchronized burst pattern creates wave-like pressure that is more effective at destabilizing the target stack than a continuous single-connection approach.
+**Normal mode (DoS + hijack probe)**
+Used when Stage 3 is intended. Normal mode was improved to handle
+reconnects automatically and outputs `no response from <addr>: id N`
+when the target stops responding — this is the signal `wb.py` monitors
+to trigger the hijack attempt.
 
 ### Stage 3 — Why the Bond Persists
 
