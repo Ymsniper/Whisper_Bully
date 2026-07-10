@@ -1,87 +1,135 @@
 # Whisper Bully
 
-Bluetooth Deauthentication, Denial-of-Service & Hijack Tool
+**Bluetooth BDADDR Extraction, Denial-of-Service & Hijack Research Tool**
 
+> © 2026 [@Ymsniper](https://github.com/Ymsniper) — For authorized security research only.
 
-https://github.com/user-attachments/assets/de1cbfda-ca7d-460b-8af3-c45613496dd1
+---
 
+## Overview
 
-Three-stage attack on Fast Pair devices via CVE-2025-36911:
+Whisper Bully is a three-stage Bluetooth security research tool targeting devices that advertise Google Fast Pair (service UUID `fe2c`). It demonstrates two unpatched attack primitives that are **outside the scope of the CVE-2025-36911 firmware patch**:
 
-1. **Stage 1 (Extraction)**: Extract permanent hidden BD ADDR from privacy-randomized addresses
-2. **Stage 2 (Flood)**: Execute sustained L2CAP denial-of-service using EMP mode reconnect cycling
-3. **Stage 3 (Hijack)**: Establish unauthorized connection to flooded target in compromised state
+- **Unpatched BDADDR leak** — permanent identity address disclosed via plain BLE connection, no GATT interaction required, works on fully patched devices
+- **SMP authentication bypass via reset window** — persistent bond established through standard SMP Just Works during BT stack recovery after L2CAP flood, without any Fast Pair GATT handshake
 
-Extracts the real Bluetooth address from devices during pairing by monitoring `bluetoothctl` output for address change messages. Once extracted, optionally floods the target with synchronized L2CAP bursts to lock it out of connectivity, then hijacks the compromised device.
+> ⚠️ **This tool does NOT implement the Whisper Pair (Fast Pair GATT) protocol.** It never writes to the Key-Based Pairing characteristic (UUID 1236) or Account Key characteristic (UUID 1238). The attack surface described here is separate from and unaddressed by the CVE-2025-36911 pairing mode check patch.
 
-## How It Works
+---
 
-### Stage 1: Extraction (CVE-2025-36911)
+## Attack Stages
 
-Most Bluetooth devices are paired and set to non-discoverable, since general discovery scans are what most people/OSes turn off after initial setup. This is what the exploit does to reveal the hidden full BD_ADDR:
+### Stage 1 — BDADDR Extraction (Unpatched Information Disclosure)
 
-The Whisper Pair exploit (CVE-2025-36911) works by first connecting to the target device via BLE and writing a forged Fast Pair pairing request (0x00 + random 64‑byte public key + nonce) to the key‑based pairing characteristic (UUID 1236). It then writes a fake 16‑byte Account Key to the account key characteristic (UUID 1238), tricking the device into completing the bonding process. Simultaneously, the tool triggers bluetoothctl pair and monitors its output for the [CHG] Device message, which reveals the permanent BD_ADDR when the device switches from its temporary random MAC. This exposes the factory‑programmed address, enabling reliable re‑connection and subsequent denial‑of‑service attacks.
+**Root cause:** When a BLE connection is established, the Linux BlueZ host stack processes the `LL_CONNECTION_COMPLETE` event and resolves the device's Resolvable Private Address (RPA) to its permanent Identity Address, caching it in the BlueZ device table. This happens at the Link Layer / HCI level, before any GATT service interaction. No Fast Pair protocol is involved.
 
-**Steps:**
-1. Scans for devices advertising Fast Pair service (UUID `fe2c`)
-2. Establishes BLE connection to target
-3. Writes forged Fast Pair pairing request to UUID 1236
-4. Writes fake Account Key to UUID 1238
-5. Triggers bluetoothctl pair and monitors for `[CHG] Device` address change
-6. Captures permanent BD ADDR that appears during bonding
-7. Falls back to device list comparison if direct capture fails
+**What the code actually does:**
 
-### Stage 2: Flooding (L2CAP EMP Mode)
+1. Performs an active BLE scan (`BleakScanner`) for devices advertising Fast Pair service UUID `fe2c` — used only for target identification, no protocol interaction
+2. Establishes a plain BLE connection via `BleakClient.connect()` — no GATT writes of any kind
+3. Sets the BlueZ agent to `NoInputNoOutput` in preparation for Step 4
+4. Checks whether the Fast Pair GATT service is present on the target — this check is **advisory only**; the tool continues regardless of the result (line 452 of `wb.py`)
+5. Runs `bluetoothctl pair <rpa_addr>` — standard Bluetooth SMP pairing attempt, not Fast Pair
+6. Monitors `bluetoothctl` stdout for `Bonded: yes` output, which may carry the bonded address
+7. **Primary fallback:** Calls `bluetoothctl devices` and compares against the initial RPA — any entry with the same device name but a different address is the permanent Identity Address, leaked by BlueZ at step 2
 
-Once permanent address is known, optionally execute sustained denial-of-service:
+**Why the patch doesn't fix this:**
 
-1. Connects to target using permanent address
-2. Sends 50 L2CAP echo packets per connection (burst)
-3. Closes connection intentionally
-4. Resynchronizes with other threads (5ms pause)
-5. Reconnects and repeats (sustained cycling)
-6. Target device locked out until attack stops
+The CVE-2025-36911 firmware fix adds a pairing mode check to the Fast Pair GATT Key-Based Pairing characteristic handler on the accessory. This tool never writes to that characteristic. The identity address leak occurs on the **attacker's Linux host** via BlueZ's own device cache — entirely outside the accessory's firmware.
 
-**Result**: Device becomes unresponsive to normal connection attempts.
+**Key behavior notes:**
+- Extraction can succeed even if the `bluetoothctl pair` step fails or times out
+- The FP GATT service presence check at step 4 does not gate the attack
+- No PIN confirmation window appears — `NoInputNoOutput` means no user interaction on either side for Just Works
 
-### Stage 3: Hijack (Post-Flood Takeover)
+---
 
-Once the device is rendered unresponsive via Stage 2 flooding, attempt unauthorized control:
+### Stage 2 — L2CAP Flooding (EMP Burst-Reconnect Mode)
 
-1. Monitor target via L2CAP probe to detect "no response" state
-2. Once device is confirmed unresponsive and in compromised state
-3. Establish L2CAP connection while device is weakened
-4. Assume control of the device while its normal defenses are disabled
-5. Optionally establish higher-level pairing/authentication
+Once the permanent address is known, optionally execute a sustained L2CAP denial-of-service using `l2flood -R` (EMP mode):
 
-**Result**: Attacker gains control of the flooded device for reconnaissance, credential extraction, or further exploitation.
+**Flood cycle (per thread):**
+1. Establish L2CAP connection to target using permanent address
+2. Send 50 L2CAP echo packets in a burst
+3. Intentionally close the connection
+4. Sleep 5ms to resynchronize all threads (wave-like synchronized pressure)
+5. Loop indefinitely
+
+**Result:** Target device becomes unresponsive to normal connection attempts while the flood is active. Device recovers fully when the attack stops — no permanent damage.
+
+**Multithread behavior:**
+- Each thread independently cycles connect → burst → close
+- Threads resync every 5ms for coordinated wave pressure
+- Effective up to ~16 threads on typical hardware; diminishing returns beyond that
+- Multiple HCI adapters can be used simultaneously for increased pressure
+
+---
+
+### Stage 3 — Hijack via SMP Just Works During Reset Window (Unpatched Auth Bypass)
+
+**Root cause:** The sustained L2CAP flood causes the target device's Bluetooth stack to crash or reset. During the recovery window — before the Fast Pair GATT service has re-registered and before the Security Manager has fully re-initialized — the device accepts a standard SMP Just Works bond from `NoInputNoOutput` without requiring the Fast Pair GATT handshake that would normally gate the bond. The resulting bond is **persistent**: it survives BT adapter resets and shows `Paired: yes` / `Bonded: yes` in `bluetoothctl info`.
+
+**Why this is a separate finding from CVE-2025-36911:**
+
+The CVE-2025-36911 patch enforces a pairing mode check in the FP GATT Key-Based Pairing characteristic handler. Stage 3 never touches that characteristic. The bond is established at the SMP layer during a window where the FP GATT server hasn't re-initialized, so the Fast Pair security gate is never even reached. A fully patched device remains vulnerable to this because the patch has no visibility into the SMP layer during stack recovery.
+
+**What the code actually does:**
+
+1. Sends an L2CAP probe (`l2flood -c -1 -t 2`) to confirm the device is unresponsive — looks for `no response from <addr>: id N` in output
+2. Once unresponsive state is confirmed, runs `bluetoothctl connect <permanent_addr>` in a retry loop
+3. SMP negotiates `NoInputNoOutput` / `NoInputNoOutput` → Just Works association model → bond completes
+4. `bluetoothctl connect` returns exit code 0 on success
+5. Bond persists after attack stops
+
+**Success probability by device state:**
+
+| Device State | Expected Result |
+|---|---|
+| Actively in flood / unresponsive | Highest success — stack in degraded state during recovery |
+| Recovering from flood | High success — temporary SM re-init window |
+| Fully recovered | Lower success — normal security restored |
+| Powered off | Fails |
+
+---
+
+## Relationship to CVE-2025-36911
+
+| | CVE-2025-36911 (WhisperPair) | This Tool |
+|---|---|---|
+| **Protocol used** | Fast Pair GATT KBP (UUID 1236 write) | None — plain BLE connect only |
+| **BDADDR leak path** | Encrypted KBP notification (BR/EDR addr) | BlueZ RPA resolution on LL_CONNECTION_COMPLETE |
+| **Auth bypass path** | FP pairing mode check missing | SMP Just Works during BT stack recovery window |
+| **Patched by 36911 fix?** | Yes | **No** |
+| **Works on patched devices?** | No | **Yes** |
+| **CWE** | CWE-287 | CWE-200 (Stage 1) + CWE-362/CWE-287 (Stage 3) |
+
+---
+
+## ⚠️ Legal Warning
+
+**This is a denial-of-service and unauthorized access research tool.**
+
+Using this tool on devices you do not own or without explicit written authorization is a **federal crime** punishable by imprisonment and fines under the Computer Fraud and Abuse Act (18 U.S.C. § 1030) and equivalent statutes in other jurisdictions.
+
+You may **only** use this tool on:
+- Devices you personally own
+- Devices for which you have **explicit written authorization** from the owner to conduct security testing
+
+---
 
 ## Requirements
 
 - Linux (tested on Ubuntu 20.04+)
-- Root privileges (required for `bluetoothctl` and Bleak)
-- `bluetoothctl` installed and functional
+- Root privileges (required for `bluetoothctl` and raw BLE access)
+- `bluetoothctl` / BlueZ installed and functional
 - Python 3.7+
-- For Stage 2/3: `l2flood` with OpenMP support (included)
+- For Stage 2/3: `l2flood` with OpenMP support — see [kovmir/l2flood](https://github.com/kovmir/l2flood)
 
-## ⚠️ LEGAL NOTICE
-
-**This is a deauthentication/denial-of-service/hijack attack tool.**
-
-Using this tool on devices you don't own or without explicit written authorization is a **FEDERAL CRIME** punishable by imprisonment and fines.
-
-You may **ONLY** use this tool on:
-- Devices you own
-- Devices with explicit written permission from the owner to test
+---
 
 ## Installation
 
-### Prerequisites
-- Python 3.7 or later
-- `bluetoothctl` (from BlueZ)
-- Development headers for D-Bus and GLib
-
-### Install system dependencies for your distro
+### System dependencies
 
 **Ubuntu / Debian:**
 ```bash
@@ -114,372 +162,220 @@ sudo zypper install -y python3 python3-pip dbus-1-devel glib2-devel bluez
 sudo xbps-install -S python3 python3-pip dbus-devel glib-devel bluez
 ```
 
-**Generic / Other distros:**
-Install equivalents of: Python 3.7+, D-Bus dev headers, GLib dev headers, BlueZ
-
-### Clone and Install
+### Clone and install
 
 ```bash
 git clone https://github.com/Ymsniper/Whisper_Bully.git
 cd Whisper_Bully
 pip3 install -r requirements.txt
-# optional for running DOS attack and hijack:
+# Required for Stage 2/3 only:
 make
 sudo make install
 ```
 
+---
+
 ## Usage
 
-### Stage 1: Extraction
-
-Extract permanent addresses from Fast Pair devices:
+### Stage 1: BDADDR Extraction
 
 ```bash
-# Auto-detect and extract
+# Auto-detect and extract all nearby Fast Pair devices
 sudo python3 wb.py
 
-# Scan for 20 seconds, save to file
+# 20 second scan, save results
 sudo python3 wb.py -s 20 -o targets.json
 
-# Custom duration and output
+# 30 second scan, custom output file
 sudo python3 wb.py -s 30 -o extracted.json
 ```
 
-**NOTE:** During the pairing step, a pop-up window will appear on your device asking for PIN verification. Always select "pin correct" or accept/confirm the pairing request to allow the extraction to proceed.
+> **Note:** If a device was previously connected or paired by this tool or manually, BlueZ already knows its identity address. Remove it first so extraction runs cleanly:
+> ```bash
+> sudo bluetoothctl remove <address>
+> ```
 
-### Stage 2: Flooding (Optional)
+---
 
-After extraction, flood the extracted addresses. Multiple methods:
+### Stage 2: L2CAP Flooding (Optional)
 
-#### Method 1: Automatic (Interactive)
+#### Method 1 — Interactive (prompted after extraction)
 ```bash
 sudo python3 wb.py -s 20 -o targets.json
-# At completion, tool asks: "Run aggressive L2CAP test... (yes/no)"
-# Answer 'yes' to automatically flood extracted addresses
+# At completion: "Run aggressive L2CAP test... (yes/no)" → yes
 ```
 
-#### Method 2: Automatic with Flags (All Stages)
+#### Method 2 — Flags (skip prompts)
 ```bash
-# Stage 1 → Stage 2 → Stage 3 (hijack after flood completes)
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack
-
-# Stage 1 → Stage 2 only
+# Stage 1 + Stage 2 only
 sudo python3 wb.py -s 20 -o targets.json --aggressive
 
-# Skip to hijack without interactive prompts
-sudo python3 wb.py -o targets.json --aggressive --hijack -d 60
+# Stage 1 + Stage 2 + Stage 3
+sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack
+
+# With duration and thread count
+sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -d 120 -t 8
 ```
 
-#### Method 3: Manual (Standalone)
+#### Method 3 — Standalone flood script
 ```bash
-# Flood targets for 120 seconds
+# Flood from extracted targets file for 120 seconds
 sudo python3 aggressive_test.py -f targets.json -d 120 -t 4
 
-# Flood targets forever (until Ctrl+C)
-sudo python3 aggressive_test.py -f targets.json -f
-
-# Flood single known address for 60 seconds
+# Flood a single known address for 60 seconds
 sudo python3 aggressive_test.py AA:BB:CC:DD:EE:FF -d 60
 
-# Flood single address forever
+# Flood forever (Ctrl+C to stop)
 sudo python3 aggressive_test.py AA:BB:CC:DD:EE:FF -f
 ```
 
+---
+
 ### Stage 3: Hijack (Optional)
 
-Attempt unauthorized connection to flooded devices:
-
-#### Method 1: Integrated Workflow
 ```bash
-# Extract, flood, AND hijack in one command
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack
-
-# Same, but with custom flood duration
+# Integrated — extract, flood, then hijack
 sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -d 120
 
-# Interactive: answer prompts for flood duration and hijack attempt
-sudo python3 wb.py -s 20 -o targets.json
-# ... extraction completes ...
-# AGGRESSIVE L2CAP TESTING (OPTIONAL)
-# Run aggressive L2CAP test on extracted addresses now? (yes/no): yes
-#
-# Flood duration in seconds (default 60): 60
-# Number of threads (default: CPU count): 4
-# Attempt hijack after flood? (yes/no): yes
+# Manual standalone hijack on known address
+sudo python3 wb.py -H AA:BB:CC:DD:EE:FF
 ```
 
-#### Method 2: Manual Hijack (Standalone)
+---
+
+### Full Three-Stage Run (One Command)
+
 ```bash
-# Hijack after detecting device is unresponsive (uses l2flood to probe)
-sudo python3 wb.py -H 11:22:33:44:55:66
-
-# Hijack specific addresses from extracted targets file
-sudo python3 wb.py -f targets.json -H
+sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -d 120 -t 4
 ```
+
+**Execution flow:**
+1. Scan 20 seconds for Fast Pair devices
+2. Extract permanent BDADDR from each target
+3. Flood all targets for 120 seconds using 4 threads
+4. Monitor for unresponsive state
+5. Attempt hijack on each target during recovery window
+6. Save results to `targets.json`
+
+---
+
+### Multi-Adapter Attack
+
+```bash
+# Terminal 1
+sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -i hci0 -d 120 -t 4 &
+
+# Terminal 2
+sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -i hci1 -d 120 -t 4
+```
+
+Doubles DoS pressure and increases hijack success probability during the recovery window.
+
+---
 
 ## Command-Line Flags
 
-### Main Flags (wb.py)
-
 | Flag | Description |
-|------|-------------|
+|---|---|
 | `-s, --scan-time` | BLE scan duration in seconds (default: 10) |
 | `-o, --output` | Save extracted addresses to JSON file |
-| `--aggressive` | Skip prompts and run Stage 2 (flood) immediately (requires prior authorization) |
-| `-H, --hijack` | Attempt Stage 3 (hijack) after Stage 2 completes (requires `--aggressive` or interactive yes) |
-| `-d, --duration` | Flood duration in seconds (default: 60) or 'f' for forever |
-| `-t, --threads` | Number of parallel L2CAP flood threads (default: CPU count) |
-| `-i, --hci` | Specific HCI adapter to use (e.g., hci0, hci1) |
-
-### Usage Examples
-
-```bash
-# Full three-stage attack in one command
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -d 120 -t 4
-
-# Stage 1 + Stage 2 only (no hijack)
-sudo python3 wb.py -s 20 -o targets.json --aggressive -d 90
-
-# Stage 1 only (interactive prompts for further stages)
-sudo python3 wb.py -s 20 -o targets.json
-
-# Extract from specific HCI adapter, then flood and hijack
-sudo python3 wb.py -s 15 -o targets.json --aggressive --hijack -i hci1 -t 8
-
-# Use multiple adapters for increased flood pressure
-sudo python3 wb.py -s 20 -o targets.json --aggressive -i hci0 -d 120 &
-sudo python3 wb.py -s 20 -o targets.json --aggressive -i hci1 -d 120
-```
-
-## Output Format
-
-Extracted addresses saved as JSON (per target):
-
-```json
-{
-  "device_name": "Device Name",
-  "temporary_address": "AA:BB:CC:DD:EE:FF",
-  "permanent_address": "11:22:33:44:55:66",
-  "rssi": -45
-}
-```
-
-The `permanent_address` is the real BD ADDR. Use this for Stage 2 flooding and Stage 3 hijacking.
-
-## Stage-by-Stage Details
-
-### Stage 1: Extraction Details
-
-**Trigger Conditions:**
-- Device advertises Fast Pair service (UUID fe2c)
-- Device responds to BLE connection within scan window
-- Pairing initiates successfully
-
-**Extraction Method:**
-- Monitors `bluetoothctl` output for `[CHG] Device` messages
-- Captures permanent address during pairing handshake
-- Falls back to post-pairing device list scan
-
-**Limitations:**
-- Only works on Linux with `bluetoothctl`
-- Some devices may not advertise Fast Pair service
-- Advertised MAC may change during connection (address rolling - timing issue)
-- Device must not already be paired/known
-
-**Mitigation:**
-- Forget device before extraction: `bluetoothctl remove <address>`
+| `--aggressive` | Skip prompts, run Stage 2 immediately (requires prior written authorization) |
+| `-H, --hijack` | Attempt Stage 3 hijack after Stage 2 (requires `--aggressive` or interactive yes) |
+| `-d, --duration` | Flood duration in seconds (default: 60) or `f` for forever |
+| `-t, --threads` | Parallel L2CAP flood threads (default: CPU count) |
+| `-i, --hci` | HCI adapter to use (e.g. `hci0`, `hci1`) |
 
 ---
 
-### Stage 2: Aggressive L2CAP Flooding Details
+## Technical Details
 
-**EMP Mode (Burst-Reconnect Cycling):**
+### Stage 1 — Why Extraction Works Without GATT Interaction
 
-The `-R` flag in l2flood implements:
+The Fast Pair FE2C service UUID is used **only as a scan filter** to identify candidate targets. Once a BLE connection is established:
 
-1. **Connect Phase**: Establish L2CAP connection to target
-2. **Burst Phase**: Send 50 L2CAP echo packets per connection
-3. **Close Phase**: Intentionally close connection
-4. **Resync Phase**: All threads sleep 5ms for synchronization
-5. **Loop**: Repeat continuously (sustained pressure)
+- The Link Layer completes the connection handshake and fires `LL_CONNECTION_COMPLETE` to the host
+- BlueZ processes this event and, if the device uses a Resolvable Private Address, resolves it against its IRK cache or simply registers the identity address from the connection parameters
+- The identity address is cached in BlueZ's internal device table
+- `bluetoothctl devices` then shows both the original RPA and the newly registered identity address — same device name, different address
+- The tool compares against the original RPA and returns the new entry as the permanent BDADDR
 
-**Configuration Options:**
+The `bluetoothctl pair` call that runs concurrently may or may not succeed — the BDADDR is typically already in the table by the time the pair command completes or fails.
 
-```bash
-# Flood parameters via wb.py
-sudo python3 wb.py -o targets.json --aggressive \
-  -d 120 \           # 120 second flood duration
-  -t 8 \             # 8 parallel threads
-  -i hci0            # Use hci0 adapter
-```
+### Stage 2 — EMP Mode (`l2flood -R`)
 
-**Flood Characteristics:**
-- Causes device to stop responding to normal connections
-- Target becomes unavailable for legitimate pairing/connection
-- Device remains vulnerable while flood is active
-- Device recovers when attack stops (no permanent damage)
+The `-R` flag in `l2flood` implements burst-reconnect cycling:
 
-**Multithread Impact:**
-- Each thread independently cycles connect→burst→close
-- Threads resynchronize every 5ms for wave-like pressure
-- Higher thread count = greater DoS intensity
-- Diminishing returns beyond ~16 threads on typical hardware
+1. Establish L2CAP connection
+2. Send 50 echo packets
+3. Close connection intentionally
+4. 5ms thread resynchronization sleep
+5. Loop
 
----
+This synchronized burst pattern creates wave-like pressure that is more effective at destabilizing the target stack than a continuous single-connection approach.
 
-### Stage 3: Hijack Details
+### Stage 3 — Why the Bond Persists
 
-**Pre-Hijack Verification:**
+The resulting bond is not a transient connection — it is a full SMP bond stored by BlueZ:
 
-Before attempting hijack, the tool verifies device is truly unresponsive:
-
-1. Sends L2CAP probe using `l2flood -c -1 -t 2` (2 second timeout)
-2. Waits for "no response from <addr>" message
-3. Confirms device is in compromised state
-
-**Hijack Execution:**
-
-Once verified unresponsive:
-
-1. Attempt connection via `bluetoothctl connect <permanent_address>`
-2. Exploit weakened device state during DoS recovery
-3. Establish L2CAP link while device defenses are disabled
-4. Return control channel to operator
-
-**Hijack Success Conditions:**
-- Device must be unresponsive (verified by probe)
-- Connection attempt during flood/recovery window
-- Device in vulnerable link-layer state
-- L2CAP handling compromised by sustained packet pressure
-
-**Expected Outcomes:**
-
-| Scenario | Result |
-|----------|--------|
-| Device in flood state | Hijack likely succeeds; device accepts connection while under duress |
-| Device recovering from flood | High success probability; temporary defense gap |
-| Device fully recovered | Lower success; normal security restored |
-| Device powered off | Hijack fails (device offline) |
-
----
-
-## Combined Workflows
-
-### Quick Scan → Flood → Hijack (One Command)
-
-```bash
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -d 120
-```
-
-**Execution Flow:**
-1. Scan for 20 seconds
-2. Extract permanent addresses
-3. Flood all targets for 120 seconds
-4. Detect "no response" state
-5. Attempt hijack on each target
-6. Save results to targets.json
-
-### Multi-Adapter Distributed Attack
-
-```bash
-# Terminal 1: Use adapter hci0
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack \
-  -i hci0 -d 120 -t 4 &
-
-# Terminal 2: Use adapter hci1 (additional pressure on same target)
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack \
-  -i hci1 -d 120 -t 4
-```
-
-**Effect:**
-- Doubles the DoS pressure (two adapters flooding simultaneously)
-- Increases hijack success probability during recovery window
-- Requires multi-radio hardware setup
-
-### Extended Duration Flood (Forever Mode)
-
-```bash
-# Flood indefinitely until manual stop (Ctrl+C)
-sudo python3 wb.py -s 20 -o targets.json --aggressive -f
-
-# Or with hijack enabled (attempts hijack if device goes unresponsive)
-sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -f
-```
+- `bluetoothctl info <addr>` shows `Paired: yes`, `Bonded: yes`, `Trusted: no`
+- Bond survives `bluetoothctl power off/on` cycles
+- Bond survives attacker machine reboot (stored in `/var/lib/bluetooth/`)
+- Device accepts subsequent connections from attacker adapter without re-pairing
 
 ---
 
 ## Known Limitations
 
-### Stage 1 (Extraction)
-- Only works on Linux with `bluetoothctl`
-- Some devices may not advertise Fast Pair service
-- Advertised MAC address could change during the connection step (address rolling - timing issue)
-- If you're testing on a device that has already been connected/paired via this tool or manually, you need to forget (remove) it first so the script can work properly.
+### Stage 1
+- Requires Linux with BlueZ / `bluetoothctl`
+- Target must not already be in BlueZ device table under the RPA (remove first if needed)
+- Address rolling during the connection window can cause timing issues — re-run if extraction fails
 
-### Stage 2 (Flooding)
-- Requires knowing permanent address (get from Stage 1 or other means)
-- Target must be within Bluetooth range and powered on
-- Device recovers after attack stops (no permanent damage)
+### Stage 2
+- Requires knowing the permanent address (from Stage 1 or other means)
+- Target must be powered on and within range
+- Device recovers fully when flood stops — no persistent effect
 
-### Stage 3 (Hijack)
+### Stage 3
 - Requires device to enter unresponsive state (Stage 2 dependency)
-- Success depends on timing during device recovery window
-- Does not work on devices that remain powered off
-- Device must support the connection method (L2CAP)
-- Does not guarantee successful authentication/pairing
+- Success is timing-dependent — hijack must land during the recovery window
+- Does not work if device powers off during flood
 
 ---
 
 ## Troubleshooting
 
-### No devices found
-- Check `bluetoothctl` is working: `sudo bluetoothctl list`
-- Increase scan duration: `-s 30`
+**No devices found**
+- Verify `bluetoothctl` is working: `sudo bluetoothctl list`
+- Increase scan time: `-s 30`
 
-### BLE connection failed, Failed to extract
-- If you're testing on a device that has already been connected/paired via this tool or manually, you need to forget (remove) it first so the script can work properly.
-- Use: `sudo bluetoothctl remove <addr>`
-- Device may not support Fast Pair service
+**BLE connection failed / extraction fails**
+- Remove device from BlueZ first: `sudo bluetoothctl remove <addr>`
+- Re-run — RPA rolling can cause timing issues
 
-### Extraction fails with fallback
-- Timing issue: pairing completed before address capture
-- Device may not support Fast Pair service advertisement
-- Try again: timing is sometimes unpredictable
-
-### Flood has no effect (devices still responsive)
+**Flood has no effect**
 - Increase thread count: `-t 16`
 - Use multiple adapters simultaneously
-- Verify permanent address is correct
-- Some devices may have robust L2CAP error handling
+- Verify the permanent address (not the RPA) is being targeted
 
-### Permission denied
+**Permission denied**
 - Run with `sudo`
-- Ensure your user can access `/dev/bluetooth` (may need to be in `bluetooth` group)
+- Ensure user is in `bluetooth` group or run as root
 
-### Bleak import error
-- Verify system dependencies are installed (see Installation section)
+**`bleak` import error**
 - Debian/Ubuntu: `sudo apt install libdbus-1-dev libglib2.0-dev`
 - Fedora: `sudo dnf install dbus-devel glib2-devel`
 - Arch: `sudo pacman -S dbus glib`
-- Alpine: `apk add dbus-dev glib-dev`
 
-### bluetoothctl not found
-- Ubuntu/Debian: `sudo apt install bluez`
-- Fedora/RHEL: `sudo dnf install bluez`
-- Arch: `sudo pacman -S bluez`
-- Alpine: `apk add bluez bluez-openrc`
-- openSUSE: `sudo zypper install bluez`
-- Void: `sudo xbps-install bluez`
+**D-Bus errors**
+- `sudo systemctl start dbus && sudo systemctl start bluetooth`
 
-### D-Bus connection errors
-- Ensure D-Bus daemon is running: `sudo systemctl start dbus`
-- Make D-Bus start on boot: `sudo systemctl enable dbus`
-- Check Bluetooth service: `sudo systemctl status bluetooth`
+---
 
-### Python version conflict
-- Ensure you're using Python 3.7+: `python3 --version`
-- Some systems may require explicit `python3` instead of `python`
-- Consider using `python3 -m pip` instead of `pip3`
+## Credits
+
+- [@kovmir](https://github.com/kovmir) for [l2flood](https://github.com/kovmir/l2flood)
+- [KU Leuven COSIC](https://github.com/KULeuven-COSIC/WhisperPair) for the original WhisperPair / CVE-2025-36911 research
 
 ---
 
@@ -487,16 +383,6 @@ sudo python3 wb.py -s 20 -o targets.json --aggressive --hijack -f
 
 MIT. See LICENSE for details.
 
-## Author
-
-[@Ymsniper](https://github.com/Ymsniper)
-
-## CREDITS
-
-[@kovmir](https://github.com/kovmir) for [@l2flood](https://github.com/kovmir/l2flood)
-
 ## Disclaimer
 
-This tool is for authorized security testing and defensive research only. Unauthorized access to Bluetooth devices is illegal. Only use on devices you own or have explicit permission to test.
-
-**Stage 3 (Hijack) is an advanced exploitation capability.** Using this tool to take control of devices you do not own or without explicit authorization constitutes unauthorized computer access and is punishable under applicable cybercrime statutes.
+This tool is for authorized security testing and defensive research only. Unauthorized access to Bluetooth devices is illegal. Only use on devices you own or have explicit written permission to test. The author assumes no liability for unauthorized or illegal use.
