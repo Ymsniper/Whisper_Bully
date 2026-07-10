@@ -17,6 +17,10 @@ Whisper Bully is a three-stage Bluetooth security research tool targeting device
 
 ---
 
+
+https://github.com/user-attachments/assets/67f2bcb6-38ad-4ba0-80c5-36dbb54f3f11
+
+
 ## Attack Stages
 
 ### Stage 1 — BDADDR Extraction (Unpatched Information Disclosure)
