@@ -564,10 +564,9 @@ def div(char="─", n=66): print(f"{DIM}{char * n}{RESET}")
 
 def print_banner():
     print(RED + ASCII_ART + RESET)
-    div("═")
-    print(f"  {BRED}Whisper Bully{RESET}  {DIM}·{RESET}  Fast Pair BD ADDR Extractor")
-    print(f"  {DIM}CVE-2025-36911  ·  github.com/your-org/whisper-bully{RESET}")
-    div("═")
+    print(RED + "▓▒░" + "─" * 58 + "░▒▓" + RESET)
+    print(f"  {BRED}Whisper Bully{RESET}  {RED}·{RESET}  {RED}Fast Pair BD ADDR Extractor{RESET}\n  {RED}CVE-2025-36911  ·  github.com/Ymsniper/Whisper_Bully{RESET}")
+    print(RED + "▓▒░" + "─" * 58 + "░▒▓" + RESET)
     print()
 
 
